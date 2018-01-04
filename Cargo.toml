@@ -1,0 +1,6 @@
+[package]
+name = "aerate"
+version = "0.1.0"
+authors = ["Hari Bhaskaran"]
+
+[dependencies]
