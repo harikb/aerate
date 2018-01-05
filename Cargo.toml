@@ -4,3 +4,5 @@ version = "0.1.0"
 authors = ["Hari Bhaskaran"]
 
 [dependencies]
+walkdir = "2"
+rust-crypto = "0.2.36"
