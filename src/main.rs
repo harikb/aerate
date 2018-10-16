@@ -1,6 +1,4 @@
 extern crate clap;
-extern crate crypto;
-extern crate getopts;
 extern crate walkdir;
 
 mod checksum;
