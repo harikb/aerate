@@ -1,29 +1,24 @@
-extern crate args;
+extern crate clap;
 extern crate crypto;
 extern crate getopts;
 extern crate walkdir;
 
-use walkdir::WalkDir;
-use std::io::prelude::*;
-use std::fs::File;
-use std::io;
-use std::io::{Error, ErrorKind};
-use std::io::BufReader;
-use std::io::BufWriter;
 use self::crypto::digest::Digest;
 use self::crypto::sha1::Sha1;
-use std::env;
 use std::collections::HashMap;
+use std::fs::File;
 use std::fs::OpenOptions;
-use std::process;
+use std::io;
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
+use walkdir::WalkDir;
 
+use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use std::fs;
 use std::path::Path;
-use args::{Args, ArgsError};
-
-const PROGRAM_DESC: &'static str =
-    "Calculates checksums for all files under (recursively) a given directory";
 
 /* Sample output of this program
 f550855......940a8cc310a427	362	config	./.git/config
@@ -34,41 +29,33 @@ acbaef2......456fbbe8c84724	23	HEAD	./.git/HEAD
 struct FileMetaData {
     fname: String,
     hash: String,
-    path: String,
     sz: u64,
 }
 
-fn parse_args() -> Result<(Args), ArgsError> {
-    let raw_args: Vec<String> = env::args().collect();
-    let mut args = Args::new(&raw_args[0], PROGRAM_DESC);
-
-    args.flag("h", "help", "Print the usage menu");
-
-    args.flag(
-        "r",
-        "resume",
-        "Resume (updating checksum file) from where we left off",
-    );
-
-    args.flag(
-        "c",
-        "check",
-        "Check current files against the checksum-file",
-    );
-
-    try!(args.parse(raw_args));
-
-    let help = try!(args.value_of("help"));
-    if help {
-        println!("{}", args.full_usage());
-        return Err(ArgsError::new("", "")); // I have to create an ArgsError
-    }
-
-    Ok(args)
+fn parse_args() -> ArgMatches<'static> {
+    return App::new("aerate")
+        .arg(
+            Arg::with_name("v")
+                .short("v")
+                .multiple(true)
+                .help("Sets the level of verbosity"),
+        )
+        .subcommand(SubCommand::with_name("resume"))
+        .subcommand(SubCommand::with_name("update"))
+        .subcommand(SubCommand::with_name("check"))
+        .setting(AppSettings::SubcommandRequired)
+        .get_matches();
 }
-
+// -------------------------------------------------------------
+// load_checksum_file() opens and parses a checksum manifest file
+// with specific format shows in the example at the top of this
+// file. `ignore_errors` parameter decides whether incomplete lines
+// at the bottom of the checksum file are ignored. If a previous
+// run was interrupted, incomplete lines are to be expected.
+// -------------------------------------------------------------
 fn load_checksum_file(
-    checksum_file: &str,
+    checksum_file: &String,
+    ignore_errors: bool,
 ) -> io::Result<HashMap<std::path::PathBuf, FileMetaData>> {
     let mut file_checksums = HashMap::new();
 
@@ -82,11 +69,15 @@ fn load_checksum_file(
                     Ok(line) => {
                         let v: Vec<&str> = line.split("\t").collect();
                         if v.len() == 4 {
-                            let mut sz1 = 0;
+                            let mut sz1: u64;
                             match v[1].parse::<u64>() {
                                 Ok(n) => sz1 = n,
                                 Err(e) => {
-                                    return Err(Error::new(ErrorKind::Interrupted, e));
+                                    if ignore_errors {
+                                        break;
+                                    } else {
+                                        return Err(Error::new(ErrorKind::Interrupted, e));
+                                    }
                                 }
                             }
                             // String::from is required to keep contents
@@ -98,9 +89,17 @@ fn load_checksum_file(
                                     fname: String::from(v[2]),
                                     hash: String::from(v[0]),
                                     sz: sz1, // parsed from v[1]
-                                    path: String::from(v[3]),
                                 },
                             );
+                        } else {
+                            if ignore_errors {
+                                break;
+                            } else {
+                                return Err(Error::new(
+                                    ErrorKind::Interrupted,
+                                    "Incomplete line in checksum file",
+                                ));
+                            }
                         }
                     }
                     Err(err) => {
@@ -128,61 +127,84 @@ fn gen_hashes(dir: &str, checksum_file: &str, resume: bool) -> io::Result<()> {
 
     let mut opts = OpenOptions::new();
     opts.write(true);
+    opts.create(true); // we overwrite/create even if we are 'resume'-ing
     if resume {
-        match load_checksum_file(&tn) {
+        match load_checksum_file(&tn, true) {
             Err(err) => {
                 println!("Error trying to load previous file: {}", err);
-                opts.create(true);
             }
             Ok(done_files) => {
                 already_done = done_files;
-                opts.append(true);
+                fs::rename(&tn, format!("{}.backup", &tn))?
             }
         }
     } else {
         opts.create(true);
     }
-    let ofp = try!(opts.open(Path::new(&tn)));
+    let ofp = opts.open(Path::new(&tn))?;
     let mut ofb = BufWriter::new(ofp);
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let fname: &str;
             match entry.file_name().to_str() {
-                Some(_fn) => fname = _fn,
+                Some(_fn) => match _fn {
+                    "allfiles_checksums.txt" => continue,
+                    "allfiles_checksums.txt.tmp" => continue,
+                    _ => fname = _fn,
+                },
                 None => return Err(Error::new(ErrorKind::Other, "Invalid filename!")),
             }
-            let md = try!(fs::metadata(entry.path()));
+            let md = fs::metadata(entry.path())?;
             let sz = md.len();
             {
                 count += 1;
-                if !already_done.contains_key(entry.path()) {
-                    let mut ifp = try!(File::open(entry.path()));
-                    let mut ifb = BufReader::new(ifp);
-                    hasher.reset();
-                    loop {
-                        let res = ifb.read(&mut buffer);
-                        match res {
-                            Ok(n) => {
-                                if n > 0 {
-                                    hasher.input(&buffer[0..n])
-                                } else {
-                                    break;
+                match already_done.get(entry.path()) {
+                    Some(row) => writeln!(
+                        ofb,
+                        "{}\t{}\t{}\t{}",
+                        row.hash,
+                        row.sz,
+                        row.fname,
+                        entry.path().display()
+                    )?,
+                    None => {
+                        let mut ifp = File::open(entry.path())?;
+                        let mut ifb = BufReader::new(ifp);
+                        hasher.reset();
+                        loop {
+                            let res = ifb.read(&mut buffer);
+                            match res {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        hasher.input(&buffer[0..n])
+                                    } else {
+                                        break;
+                                    }
                                 }
+                                Err(err) => panic!(err),
                             }
-                            Err(err) => panic!(err),
                         }
+                        let h = hasher.result_str();
+                        writeln!(ofb, "{}\t{}\t{}\t{}", h, sz, fname, entry.path().display(),)?
                     }
-                    let h = hasher.result_str();
-                    writeln!(ofb, "{}\t{}\t{}\t{}", h, sz, fname, entry.path().display(),);
                 }
                 if count == 1 || count % 100 == 0 {
-                    println!("Checked {} files. Last {}", count, entry.path().display())
+                    println!(
+                        "Checksumed {} files. Last {}",
+                        count,
+                        entry.path().display()
+                    )
                 }
             }
         }
     }
-    println!("Checked {} files", count);
+    ofb.flush()?;
+    drop(ofb);
+
+    fs::rename(&tn, &checksum_file)?;
+
+    println!("Checksumed {} files. Result in {}", count, &checksum_file);
     Ok(())
 }
 
@@ -192,7 +214,7 @@ f550855......940a8cc310a427	362	config	./.git/config
 acbaef2......456fbbe8c84724	23	HEAD	./.git/HEAD
 9f2aa63......ed0833b479479c	177	README.sample	./.git/hooks/README.sample
 */
-fn check_hashes(dir: &str, checksum_file: &str) -> io::Result<()> {
+fn check_hashes(dir: &str, checksum_file: &String) -> io::Result<()> {
     let mut buffer: Vec<u8> = vec![0; 1024 * 1024];
     let mut count = 0;
 
@@ -200,7 +222,7 @@ fn check_hashes(dir: &str, checksum_file: &str) -> io::Result<()> {
     let already_done: HashMap<std::path::PathBuf, FileMetaData>;
     let mut checked: HashMap<std::path::PathBuf, bool> = HashMap::new();
 
-    match load_checksum_file(checksum_file) {
+    match load_checksum_file(checksum_file, false) {
         Err(err) => {
             return Err(err);
         }
@@ -211,11 +233,20 @@ fn check_hashes(dir: &str, checksum_file: &str) -> io::Result<()> {
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
-            let md = try!(fs::metadata(entry.path()));
+            let md = fs::metadata(entry.path())?;
             let sz = md.len();
             {
                 count += 1;
-                let mut ifp = try!(File::open(entry.path()));
+                let fname: &str;
+                match entry.file_name().to_str() {
+                    Some(_fn) => match _fn {
+                        "allfiles_checksums.txt" => continue,
+                        "allfiles_checksums.txt.tmp" => continue,
+                        _ => fname = _fn,
+                    },
+                    None => return Err(Error::new(ErrorKind::Other, "Invalid filename!")),
+                }
+                let mut ifp = File::open(entry.path())?;
                 let mut ifb = BufReader::new(ifp);
                 hasher.reset();
                 loop {
@@ -261,27 +292,11 @@ fn check_hashes(dir: &str, checksum_file: &str) -> io::Result<()> {
 }
 
 fn main() {
-    match parse_args() {
-        Ok(args) => match args.value_of::<bool>("check") {
-            Ok(x) => {
-                if x {
-                    check_hashes(".", "allfiles_checksums.txt").expect("check_hashes failed");
-                } else {
-                    gen_hashes(
-                        ".",
-                        "allfiles_checksums.txt",
-                        args.value_of("resume").unwrap(),
-                    ).expect("gen_hashes failed");
-                }
-            }
-            Err(err) => {
-                println!("{}", err);
-                process::exit(0);
-            }
-        },
-        Err(err) => {
-            println!("{}", err);
-            process::exit(0);
-        }
+    let args = parse_args();
+    if args.is_present("update") || args.is_present("resume") {
+        gen_hashes(".", "allfiles_checksums.txt", args.is_present("resume"))
+            .expect("gen_hashes failed");
+    } else if args.is_present("check") {
+        check_hashes(".", &String::from("allfiles_checksums.txt")).expect("check_hashes failed");
     }
 }
